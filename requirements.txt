@@ -1,0 +1,8 @@
+anthropic
+openai
+google-genai
+python-dotenv
+matplotlib
+numpy
+scipy
+mcp>=1.28

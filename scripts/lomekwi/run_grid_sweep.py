@@ -1,0 +1,252 @@
+"""Random-grid sweep over (N, T) for the explicit-pickup Lomekwi world, Haiku only.
+
+We sample SAMPLE_N points uniformly WITHOUT replacement from the grid
+N in [1, 20] x T in [2, 10] (180 cells) and run one Lomekwi episode per sampled
+cell. The degenerate boundaries are excluded: T<2 has no distinct byproduct pair
+(the machine is unbuildable, pure-grind worlds) and N=0 has no doors (trivially
+solved). Pickup is FREE, so the BUDGET scales exactly as in lomekwi_world:
+budget = sweep_config.budget_for(N) (a function of N only; T does not change it).
+
+Each row carries variant="pickup" so replay/analyze route correctly. Rep i
+uses relabel_seed = drop_seed = i (reproducible; SAMPLE_SEED fixes which cells).
+
+Cost: see the USD estimate printed at startup (grounded in real Haiku usage from
+prior budget sweeps). Run with --dry-run to print the sampled cells + estimate
+and exit WITHOUT calling the API.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from scripts.lomekwi.lomekwi import run
+from scripts.lomekwi import sweep_config as cfg
+from scripts.shared.raw_chat import _provider_for
+
+# --- sweep knobs -------------------------------------------------------
+# Model roster: each model gets its own run dir (grid_sweep_<tag>_<ts>) and is
+# run sequentially. `--model <id>` overrides the roster with a single model.
+# Local Gemma via Ollama (the ":" in each id routes to the ollama provider; edit
+# the family tag to match `ollama list`, e.g. gemma3, if needed). Anthropic
+# models are unhooked for now -- kept commented to bring back later.
+MODELS = [
+    "qwen3.5:4b",
+    "qwen3.5:9b",
+    # "claude-haiku-4-5-20251001",
+    # "claude-sonnet-4-6",
+    # "claude-opus-4-8",
+]
+N_RANGE = range(1, 21)                 # N = 1..20 inclusive (N=0 is trivially solved)
+T_RANGE = range(2, 11)                 # T = 2..10 inclusive (T<2 has no recipe pair)
+SAMPLE_N = 100                         # random points over the grid
+SAMPLE_SEED = 20260618                 # fixes WHICH cells are sampled
+
+# --dense mode: a small DENSE grid run with multiple reps per cell (each rep gets a
+# distinct relabel/drop seed -> an independent world). Used for focused, statistically
+# meaningful cells rather than the 1-ep-per-cell random scatter.
+DENSE_N = [9, 10, 11]
+DENSE_T = [2, 3, 4]
+REPS = 20
+# Dense sweeps land in their own folder so all models (anthropic + qwen) sit
+# together; scatter sweeps stay at the runs/ root.
+DENSE_OUT_ROOT = Path("runs") / "grid" / "dense"
+# Auto-fail an episode that makes NO state progress (no new key/type/door/machine)
+# for this many executed actions -- caps runaway "spinning" episodes.
+NO_PROGRESS_WINDOW = 20
+
+
+def sampled_points() -> list[tuple[int, int]]:
+    grid = [(n, t) for n in N_RANGE for t in T_RANGE]
+    return random.Random(SAMPLE_SEED).sample(grid, SAMPLE_N)
+
+
+def dense_points(reps: int = REPS) -> list[tuple[int, int]]:
+    """DENSE_N x DENSE_T, each cell repeated `reps` times. Reps are consecutive so
+    each gets a distinct rep index (= relabel_seed = drop_seed) -> distinct world."""
+    cells = [(n, t) for n in DENSE_N for t in DENSE_T]
+    return [c for c in cells for _ in range(reps)]
+
+
+def max_turns_for(n: int, budget: int) -> int:
+    """Turn cap > budget + pickups. Free pickups add up to one turn per examine,
+    so turns can reach ~2*budget; give headroom for opens and stray pickups."""
+    return 2 * budget + 2 * n + 80
+
+
+# --- cost estimate (Haiku 4.5: $1/1M in, $5/1M out, $0.10/1M cache-read,
+#     $1.25/1M cache-write) -------------------------------------------------
+# Anchored on REAL haiku usage from prior no-pickup budget sweeps (full price, no
+# cache discount assumed -> conservative): n=8 ~ $0.064/ep, n=20 ~ $0.134/ep.
+# Linear fit base_cost(N) ~ 0.018 + 0.0058*N. Lomekwi's free pickups add ~one turn
+# per examine, and each turn re-sends the growing transcript, so per-episode
+# tokens scale super-linearly with turns -- we apply a 2.0x (likely) .. 3.0x
+# (upper) factor.
+def estimate_usd(points: list[tuple[int, int]]) -> tuple[float, float]:
+    def base_cost(n: int) -> float:
+        return 0.018 + 0.0058 * n
+    base = sum(base_cost(n) for n, _ in points)
+    return 2.0 * base, 3.0 * base
+
+
+# Grounded per-episode Lomekwi cost (actual 100-ep runs, 2026-06-18): Haiku ~$0.12,
+# Sonnet ~$0.12, Opus ~$0.59. NOT a reprice of a cheaper model -- Opus emits far
+# more output tokens, so it is ~5x, not ~1.8x. See memory haiku-sweep-cost-model.
+PER_EP_USD = {"haiku": 0.12, "sonnet": 0.12, "opus": 0.59}
+
+
+def model_tag(model: str) -> str:
+    if "sonnet" in model: return "sonnet"
+    if "haiku" in model: return "haiku"
+    if "opus" in model: return "opus"
+    # generic (e.g. ollama "gemma4:12b" -> "gemma4-12b"): strip path/punctuation
+    return model.split("/")[-1].replace(".", "-").replace(":", "-")
+
+
+def print_cost_estimate(model: str, points: list[tuple[int, int]]):
+    tag = model_tag(model)
+    if tag in PER_EP_USD:
+        est = PER_EP_USD[tag] * len(points)
+        names = {"haiku": "Haiku 4.5", "sonnet": "Sonnet 4.6", "opus": "Opus 4.8"}
+        print(f"  ESTIMATED COST ({names[tag]}): ~${est:.1f} USD "
+              f"({len(points)} eps x ${PER_EP_USD[tag]:.2f}/ep, grounded)", flush=True)
+    elif _provider_for(model) in ("ollama", "vllm"):
+        print(f"  COST: local ({_provider_for(model)}) -- no API spend", flush=True)
+
+
+async def run_one_model(model: str, points: list[tuple[int, int]],
+                        resume_dir: Path | None, out_root: Path = Path("runs")):
+    """Run the sweep for a single model into its own (or a resumed) run dir."""
+    tag = model_tag(model)
+    concurrency = cfg.CONCURRENCY[_provider_for(model)]
+    done_idx: set[int] = set()
+    if resume_dir is not None:
+        out_dir = resume_dir
+        out_path = out_dir / "episodes.jsonl"
+        # Keep only SUCCESSFUL episodes (no "error" key); errored ones (e.g. from a
+        # server crash) are dropped so they get re-run. Rewrite the file de-duped by
+        # relabel_seed (last success wins) so resume never double-counts.
+        good: dict[int, str] = {}
+        n_err = 0
+        for l in out_path.read_text().splitlines():
+            if not l.strip():
+                continue
+            row = json.loads(l)
+            if row.get("error"):
+                n_err += 1
+                continue
+            good[row["relabel_seed"]] = l
+        out_path.write_text("\n".join(good[k] for k in sorted(good)) +
+                            ("\n" if good else ""))
+        done_idx = set(good)
+        print(f"\nResuming {out_path}: {len(done_idx)} done (dropped {n_err} errored), "
+              f"{len(points) - len(done_idx)} remaining (model={model})", flush=True)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = out_root / f"grid_sweep_{tag}_{ts}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "episodes.jsonl"
+        out_path.write_text("")
+        print(f"\nWriting to {out_path}  (model={model}, concurrency={concurrency})",
+              flush=True)
+    todo = [(i, n, t) for i, (n, t) in enumerate(points) if i not in done_idx]
+
+    sem = asyncio.Semaphore(concurrency)
+    lock = asyncio.Lock()
+
+    async def one(i: int, n: int, t: int):
+        async with sem:
+            budget = cfg.budget_for(n)
+            t0 = time.time()
+            try:
+                result, trace = await run(
+                    model, n=n, n_types=t, relabel_seed=i, drop_seed=i,
+                    hint=cfg.HINT, max_turns=max_turns_for(n, budget),
+                    budget=budget, no_progress_window=NO_PROGRESS_WINDOW)
+                row = {"model": model, "n": n, "n_types": t, "hint": cfg.HINT,
+                       "variant": "pickup", "budget": budget,
+                       "relabel_seed": i, "drop_seed": i,
+                       "labels": result["labels"],
+                       "actions": [x["action"] for x in trace],
+                       "agent_texts": [x["agent_text"] for x in trace],
+                       "obs": [x["obs"] for x in trace],
+                       "solved": result["solved"],
+                       "total_actions": result["total_actions"],
+                       "pickups": result["pickups"],
+                       "usage": result["usage"],
+                       "elapsed_s": round(time.time() - t0, 2)}
+            except Exception as e:
+                row = {"model": model, "n": n, "n_types": t, "hint": cfg.HINT,
+                       "variant": "pickup", "budget": budget,
+                       "relabel_seed": i, "drop_seed": i,
+                       "error": f"{type(e).__name__}: {e}",
+                       "elapsed_s": round(time.time() - t0, 2)}
+            async with lock:
+                with out_path.open("a") as f:
+                    f.write(json.dumps(row) + "\n")
+                print(f"  [{tag} {i:3d}] N={n:2d} T={t:2d} solved={row.get('solved')} "
+                      f"actions={row.get('total_actions')} "
+                      f"pickups={row.get('pickups')} "
+                      f"{'(err)' if row.get('error') else ''}", flush=True)
+
+    await asyncio.gather(*(one(i, n, t) for (i, n, t) in todo))
+    print(f"\nDone ({model}). Episodes at: {out_path}", flush=True)
+
+
+async def main():
+    dry = "--dry-run" in sys.argv
+    # roster: --model overrides the configured MODELS list with a single model
+    if "--model" in sys.argv:
+        roster = [sys.argv[sys.argv.index("--model") + 1]]
+    else:
+        roster = list(MODELS)
+    resume_dir = None
+    if "--resume" in sys.argv:
+        resume_dir = Path(sys.argv[sys.argv.index("--resume") + 1])
+        if len(roster) != 1:
+            raise SystemExit("--resume requires a single model (pass --model too)")
+
+    dense = "--dense" in sys.argv
+    reps = int(sys.argv[sys.argv.index("--reps") + 1]) if "--reps" in sys.argv else REPS
+    points = dense_points(reps) if dense else sampled_points()
+    ns = [n for n, _ in points]
+    mode = (f"DENSE {DENSE_N}x{DENSE_T}, {reps} reps/cell" if dense
+            else f"random scatter, {SAMPLE_N} cells")
+    print(f"grid sweep [{mode}]: {len(points)} points, models={roster}", flush=True)
+    print(f"  N in [{min(ns)},{max(ns)}] (mean {sum(ns)/len(ns):.1f}), "
+          f"T in [{min(t for _, t in points)},{max(t for _, t in points)}]; "
+          f"budget=budget_for(N) (pickup is free); "
+          f"no_progress_window={NO_PROGRESS_WINDOW}", flush=True)
+    for model in roster:
+        print_cost_estimate(model, points)
+
+    if dry:
+        print("\n--dry-run: sampled (N,T) cells:")
+        for i, (n, t) in enumerate(points):
+            print(f"  [{i:3d}] N={n:2d} T={t:2d} budget={cfg.budget_for(n)}")
+        print("\nNo API calls made.")
+        return
+
+    load_dotenv()
+    # Models run sequentially -- ollama serves one model at a time, and per-model
+    # run dirs keep results separable. Each row is deterministic in the rep index.
+    if "--out-root" in sys.argv:
+        out_root = Path(sys.argv[sys.argv.index("--out-root") + 1])
+    else:
+        out_root = DENSE_OUT_ROOT if dense else Path("runs")
+    if out_root != Path("runs"):
+        out_root.mkdir(parents=True, exist_ok=True)
+    for model in roster:
+        await run_one_model(model, points, resume_dir, out_root)
+    print("\nAll models done.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
